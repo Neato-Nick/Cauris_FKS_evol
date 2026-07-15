@@ -1,21 +1,32 @@
 #!/usr/bin/env python3
 """
 Compute synonymous (S) and nonsynonymous (N) site counts for every CDS
-in a FASTA file using the unweighted Nei-Gojobori (1986) method.
+in a FASTA file using the Nei-Gojobori (1986) method, optionally with
+transition-transversion rate ratio correction (kappa).
 
-For each sense codon (stop codons excluded) at each of the three positions:
+For each sense codon at each of the three positions:
   - enumerate all 3 possible single-nucleotide changes
-  - fraction of synonymous changes at that position = n_syn / 3
+  - weight each change by kappa (if a transition) or 1 (if a transversion)
+  - synonymous fraction at that position = weighted_syn / (kappa + 2)
 Synonymous sites per codon = sum of fractions across positions (range 0-3).
 Nonsynonymous sites per codon = 3 - S_codon.
 
+When kappa=1 (default) every change carries equal weight 1/3, which is
+identical to the original unweighted Nei-Gojobori method.
+
+Transitions:   A<->G, C<->T  (same biochemical class: purine<->purine or
+               pyrimidine<->pyrimidine), weighted by kappa.
+Transversions: A<->C, A<->T, G<->C, G<->T, weighted by 1.
+
 Usage:
-  python nei_gojobori_sites.py <input.cds.fasta> [output.tsv] [--table N] [--per-codon]
+  python nei_gojobori_sites.py <input.cds.fasta> [output.tsv] \
+      [--table N] [--kappa K] [--per-codon]
 
 Arguments:
   input.cds.fasta   CDS sequences (nucleotide, in-frame, may include terminal stop)
   output.tsv        Output TSV (default: <input_stem>_NG_sites.tsv or _NG_per_codon.tsv)
   --table N         NCBI translation table number (default: 12, alternative yeast nuclear)
+  --kappa K         Transition/transversion rate ratio (default: 1.0, unweighted NG)
   --per-codon       Output one row per codon instead of per-gene totals
 """
 
@@ -29,6 +40,13 @@ from Bio.Data import CodonTable
 
 NUCLEOTIDES = ('A', 'T', 'C', 'G')
 _STOP = '*'
+_PURINES = frozenset('AG')
+_PYRIMIDINES = frozenset('CT')
+
+
+def is_transition(nuc1: str, nuc2: str) -> bool:
+    """Return True if nuc1->nuc2 is a transition (purine<->purine or pyrimidine<->pyrimidine)."""
+    return (nuc1 in _PURINES and nuc2 in _PURINES) or (nuc1 in _PYRIMIDINES and nuc2 in _PYRIMIDINES)
 
 
 def build_codon_table(table_id: int) -> dict[str, str]:
@@ -44,27 +62,37 @@ def build_codon_table(table_id: int) -> dict[str, str]:
     return codon_to_aa
 
 
-def build_sites_table(codon_to_aa: dict[str, str]) -> dict[str, tuple[float, float]]:
+def build_sites_table(
+    codon_to_aa: dict[str, str],
+    kappa: float = 1.0,
+) -> dict[str, tuple[float, float]]:
     """
     Precompute (syn_sites, nonsyn_sites) for every unambiguous sense codon.
 
-    Only sense codons get entries; stop codons are excluded.
+    Each of the 3 alternative nucleotides at each codon position is weighted
+    by kappa if it constitutes a transition, or 1 if a transversion.  The
+    synonymous fraction at each position is the sum of synonymous-change
+    weights divided by the total weight (kappa + 2).
+
+    When kappa=1 every change carries weight 1/3, reproducing the original
+    unweighted Nei-Gojobori formula.  Only sense codons get entries.
     """
+    total_weight = kappa + 2.0  # 1 transition + 2 transversions, unnormalised
     sites: dict[str, tuple[float, float]] = {}
     for codon, ref_aa in codon_to_aa.items():
         if ref_aa in (_STOP, '?'):
             continue
         syn_sum = 0.0
         for pos in range(3):
-            syn = 0
+            syn_weight = 0.0
             for nuc in NUCLEOTIDES:
                 if nuc == codon[pos]:
                     continue
                 mutated = codon[:pos] + nuc + codon[pos + 1:]
                 alt_aa = codon_to_aa.get(mutated, '?')
                 if alt_aa == ref_aa:
-                    syn += 1
-            syn_sum += syn / 3.0
+                    syn_weight += kappa if is_transition(codon[pos], nuc) else 1.0
+            syn_sum += syn_weight / total_weight
         sites[codon] = (syn_sum, 3.0 - syn_sum)
     return sites
 
@@ -179,6 +207,18 @@ def parse_args() -> argparse.Namespace:
         help="NCBI translation table number (default: 12, alternative yeast nuclear)",
     )
     p.add_argument(
+        "--kappa",
+        type=float,
+        default=1.0,
+        help=(
+            "Transition/transversion rate ratio κ for site-count weighting "
+            "(default: 1.0 = unweighted Nei-Gojobori).  Transitions are "
+            "weighted by κ, transversions by 1; synonymous fraction at each "
+            "codon position = weighted_syn / (κ + 2).  Typical coding-sequence "
+            "values are 2-4; set to 1 to reproduce the original NG method."
+        ),
+    )
+    p.add_argument(
         "--per-codon",
         action="store_true",
         help="Output one row per codon (sense/stop/ambiguous) instead of per-gene totals",
@@ -193,18 +233,27 @@ def main() -> None:
     if not input_path.exists():
         sys.exit(f"Error: input file not found: {input_path}")
 
+    if args.kappa <= 0:
+        sys.exit("Error: --kappa must be a positive number")
+
     if args.output:
         output_path = Path(args.output)
     else:
         suffix = "_NG_per_codon.tsv" if args.per_codon else "_NG_sites.tsv"
         output_path = input_path.parent / (input_path.stem + suffix)
 
+    kappa_label = (
+        "1.0 (unweighted, original Nei-Gojobori)"
+        if args.kappa == 1.0
+        else f"{args.kappa} (Ts/Tv-corrected)"
+    )
     print(f"Translation table : {args.table}", file=sys.stderr)
+    print(f"Kappa (Ts/Tv)     : {kappa_label}", file=sys.stderr)
     print(f"Input             : {input_path}", file=sys.stderr)
     print(f"Output            : {output_path}", file=sys.stderr)
 
     codon_to_aa = build_codon_table(args.table)
-    sites_table = build_sites_table(codon_to_aa)
+    sites_table = build_sites_table(codon_to_aa, kappa=args.kappa)
 
     n_written = 0
     n_skipped = 0
