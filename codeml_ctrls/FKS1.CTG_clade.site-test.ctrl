@@ -1,0 +1,19 @@
+seqfile = FKS1.interspecific_OF3.MDRclade.renamed.CDS_pal2nal.trimmed.phy
+treefile = FKS1.interspecific_OF3.MDRclade_Ckru.renamed.mafft_auto.clipkit.raxmlng_b1000.raxml.bestTree.rt_fixed
+outfile = FKS1.interspecific_OF3.MDRclade.renamed.mafft_auto.clipkit.site_models_cfreq2
+
+noisy = 3
+verbose = 1
+
+seqtype = 1
+ndata = 1
+icode = 8
+cleandata = 0
+
+model = 0 * Flat ω for branches
+NSsites = 0 1 2 7 8 * Different ω for sites (models M1a M2a M7 M8)
+CodonFreq = 2 * Use mutation-selection model
+estFreq = 0 * Use observed frequencies to calculate fitness/freq pars
+clock = 0 * Assume no clock
+fix_omega = 0 * Enables option to estimate omega
+omega = 0.5 * Initial omega value
