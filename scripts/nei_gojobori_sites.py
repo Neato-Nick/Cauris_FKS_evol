@@ -143,12 +143,15 @@ def compute_cds_sites(
     seq: str,
     codon_to_aa: dict[str, str],
     sites_table: dict[str, tuple[float, float]],
+    excluded_codons: frozenset[int] = frozenset(),
 ) -> dict:
     """
     Compute S and N for a complete CDS string.
 
     Terminal and any internal stop codons are detected and excluded.
     Codons with ambiguous bases are tallied but skipped.
+    Sense codons whose 0-based index is in excluded_codons are omitted
+    from the S/N sums and the n_sense_codons count (hotspot masking).
     """
     seq = seq.upper()
     n_total_codons = len(seq) // 3
@@ -164,7 +167,6 @@ def compute_cds_sites(
         codon = seq[i * 3 : i * 3 + 3]
 
         if codon not in codon_to_aa:
-            # Contains ambiguous nucleotide(s)
             n_ambiguous += 1
             continue
 
@@ -173,6 +175,9 @@ def compute_cds_sites(
         if aa == _STOP:
             n_stop += 1
             continue
+
+        if i in excluded_codons:
+            continue  # sense codon in a masked hotspot region
 
         s, n = sites_table[codon]
         S += s
@@ -187,6 +192,36 @@ def compute_cds_sites(
         "S": round(S, 6),
         "N": round(N, 6),
     }
+
+
+def parse_hotspot_tsv(path: Path) -> dict[str, frozenset[int]]:
+    """
+    Parse a hotspot-exclusion TSV into a dict of codon indices to skip.
+
+    Expected format — tab-separated, no header, lines beginning with '#'
+    are ignored:
+        gene_id  resid_start  resid_end
+
+    Residue positions are 1-based and inclusive (amino acid numbering).
+    Returns {gene_id: frozenset of 0-based codon indices to exclude}.
+    """
+    excluded: dict[str, set[int]] = {}
+    with open(path) as fh:
+        for line in fh:
+            line = line.strip()
+            if not line or line.startswith('#'):
+                continue
+            parts = line.split('\t')
+            if len(parts) < 3:
+                sys.exit(
+                    f"Error: hotspot TSV line has fewer than 3 tab-separated "
+                    f"fields: {line!r}"
+                )
+            gene_id = parts[0]
+            start, end = int(parts[1]), int(parts[2])
+            # convert 1-based inclusive residue range to 0-based codon indices
+            excluded.setdefault(gene_id, set()).update(range(start - 1, end))
+    return {g: frozenset(s) for g, s in excluded.items()}
 
 
 def parse_args() -> argparse.Namespace:
@@ -216,6 +251,17 @@ def parse_args() -> argparse.Namespace:
             "weighted by κ, transversions by 1; synonymous fraction at each "
             "codon position = weighted_syn / (κ + 2).  Typical coding-sequence "
             "values are 2-4; set to 1 to reproduce the original NG method."
+        ),
+    )
+    p.add_argument(
+        "--hotspot-tsv",
+        default=None,
+        metavar="FILE",
+        help=(
+            "TSV file (no header) with columns gene_id, resid_start, resid_end "
+            "(1-based amino acid positions, inclusive).  For each listed gene an "
+            "extra row is appended with suffix '_noHS' where the hotspot codons "
+            "are excluded from S and N.  Only applies to per-gene summary output."
         ),
     )
     p.add_argument(
@@ -251,6 +297,18 @@ def main() -> None:
     print(f"Kappa (Ts/Tv)     : {kappa_label}", file=sys.stderr)
     print(f"Input             : {input_path}", file=sys.stderr)
     print(f"Output            : {output_path}", file=sys.stderr)
+
+    hotspot_excluded: dict[str, frozenset[int]] = {}
+    if args.hotspot_tsv:
+        hotspot_path = Path(args.hotspot_tsv)
+        if not hotspot_path.exists():
+            sys.exit(f"Error: hotspot TSV not found: {hotspot_path}")
+        hotspot_excluded = parse_hotspot_tsv(hotspot_path)
+        print(
+            f"Hotspot exclusions : {len(hotspot_excluded)} gene(s) "
+            f"({', '.join(hotspot_excluded)})",
+            file=sys.stderr,
+        )
 
     codon_to_aa = build_codon_table(args.table)
     sites_table = build_sites_table(codon_to_aa, kappa=args.kappa)
@@ -316,6 +374,28 @@ def main() -> None:
                     f"{stats['N']}\n"
                 )
                 n_written += 1
+
+                if record.id in hotspot_excluded:
+                    hs = hotspot_excluded[record.id]
+                    nohs = compute_cds_sites(
+                        seq_str, codon_to_aa, sites_table, excluded_codons=hs
+                    )
+                    out.write(
+                        f"{record.id}_noHS\t"
+                        f"{len(seq_str)}\t"
+                        f"{nohs['n_sense_codons']}\t"
+                        f"{nohs['n_stop_codons']}\t"
+                        f"{nohs['n_ambiguous_codons']}\t"
+                        f"{nohs['remainder_bases']}\t"
+                        f"{nohs['S']}\t"
+                        f"{nohs['N']}\n"
+                    )
+                    n_excluded = stats['n_sense_codons'] - nohs['n_sense_codons']
+                    print(
+                        f"  {record.id}: wrote _noHS row "
+                        f"({n_excluded} hotspot sense codon(s) excluded)",
+                        file=sys.stderr,
+                    )
         print(f"Done: {n_written} CDS written, {n_skipped} skipped.", file=sys.stderr)
 
 
